@@ -57,37 +57,28 @@ pub async fn process_udp_over_tcp(
 /// Reads from `tcp_in` and extracts UDP datagrams. Writes the datagrams to `udp_out`.
 /// Returns if the TCP socket is closed, or an IO error happens on either socket.
 async fn process_tcp2udp(
-    mut tcp_in: TcpReadHalf,
+    tcp_in: TcpReadHalf,
     udp_out: Arc<UdpSocket>,
     tcp_recv_timeout: Option<Duration>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buffer = datagram_buffer();
-    // `buffer` has unprocessed data from the TCP socket up until this index.
-    let mut unprocessed_i = 0;
-    loop {
-        let tcp_read_len =
-            maybe_timeout(tcp_recv_timeout, tcp_in.read(&mut buffer[unprocessed_i..]))
-                .await
-                .context("Timeout while reading from TCP")?
-                .context("Failed reading from TCP")?;
-        if tcp_read_len == 0 {
-            break;
-        }
-        unprocessed_i += tcp_read_len;
-
-        let processed_i = forward_datagrams_in_buffer(&udp_out, &buffer[..unprocessed_i])
+    let qsize = 10;
+    log::debug!("Initializing {qsize} TCP->UDP buffers");
+    let (empty_tx, empty_rx) = channel(qsize);
+    let (full_tx, full_rx) = channel(qsize);
+    for _ in 0..qsize {
+        empty_tx
+            .send(datagram_buffer())
             .await
-            .context("Failed writing to UDP")?;
-
-        // If we have read data that was not forwarded, because it was not a complete datagram,
-        // move it to the start of the buffer and start over
-        if unprocessed_i > processed_i {
-            buffer.copy_within(processed_i..unprocessed_i, 0);
-        }
-        unprocessed_i -= processed_i;
+            .expect("channel is not closed");
     }
-    log::debug!("TCP socket closed");
-    Ok(())
+    let reader = read_from_tcp(tcp_in, empty_rx, full_tx, tcp_recv_timeout);
+    let writer = write_to_udp(udp_out, full_rx, empty_tx);
+    pin_mut!(reader);
+    pin_mut!(writer);
+
+    // Wait until the reader or writer future terminates.
+    // TODO: is there a risk of swallowing errors here?
+    select(reader, writer).await.factor_first().0
 }
 
 async fn maybe_timeout<F: Future>(
@@ -97,6 +88,80 @@ async fn maybe_timeout<F: Future>(
     match duration {
         Some(duration) => timeout(duration, future).await,
         None => Ok(future.await),
+    }
+}
+
+async fn read_from_tcp(
+    mut tcp_in: TcpReadHalf,
+    mut empty_buffers: Receiver<Buffer>,
+    full_buffers: Sender<Buffer>,
+    tcp_recv_timeout: Option<Duration>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buffer = if let Some(b) = empty_buffers.recv().await {
+        b
+    } else {
+        return Ok(()); // writer has exited
+    };
+    let mut len = 0;
+    loop {
+        let tcp_read_len = maybe_timeout(tcp_recv_timeout, tcp_in.read(&mut buffer[len..]))
+            .await
+            .context("Timeout while reading from TCP")?
+            .context("Failed reading from TCP")?;
+        log::trace!("TCP read {} bytes", tcp_read_len);
+        if tcp_read_len == 0 {
+            break;
+        }
+        len += tcp_read_len;
+        loop {
+            if len < HEADER_LEN {
+                break;
+            }
+            let datagram_len =
+                u16::from_be_bytes(buffer[..HEADER_LEN].try_into().unwrap()) as usize;
+            if len < HEADER_LEN + datagram_len {
+                break;
+            }
+            let mut next_buffer = if let Some(b) = empty_buffers.recv().await {
+                b
+            } else {
+                return Ok(()); // writer has exited
+            };
+            // We copy extra bytes into the next buffer
+            let extra_len = len - (HEADER_LEN + datagram_len);
+            next_buffer[..extra_len].copy_from_slice(&buffer[HEADER_LEN + datagram_len..len]);
+            if full_buffers.send(buffer).await.is_err() {
+                return Ok(()); // writer has exited
+            }
+            buffer = next_buffer;
+            len = extra_len;
+        }
+    }
+    log::debug!("TCP socket closed");
+    Ok(())
+}
+
+async fn write_to_udp(
+    udp_out: Arc<UdpSocket>,
+    mut full_buffers: Receiver<Buffer>,
+    empty_buffers: Sender<Buffer>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let buffer = if let Some(b) = full_buffers.recv().await {
+            b
+        } else {
+            return Ok(()); // reader has exited
+        };
+        let datagram_len = u16::from_be_bytes(buffer[..HEADER_LEN].try_into().unwrap()) as usize;
+        let datagram = &buffer[HEADER_LEN..HEADER_LEN + datagram_len];
+        let udp_write_len = udp_out.send(datagram).await?;
+        assert_eq!(
+            udp_write_len, datagram_len,
+            "Did not send entire UDP datagram"
+        );
+        if empty_buffers.send(buffer).await.is_err() {
+            return Ok(()); // reader has exited
+        }
     }
 }
 
