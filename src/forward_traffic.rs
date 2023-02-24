@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf as TcpReadHalf, OwnedWriteHalf as TcpWriteHalf};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::timeout;
 
 /// A UDP datagram header has a 16 bit field containing an unsigned integer
@@ -41,8 +42,9 @@ pub async fn process_udp_over_tcp(
         }
     };
     let udp2tcp = async move {
-        let error = process_udp2tcp(udp_in, tcp_out).await.into_error();
-        log::error!("Error: {}", error.display("\nCaused by: "));
+        if let Err(error) = process_udp2tcp(udp_in, tcp_out).await {
+            log::error!("Error: {}", error.display("\nCaused by: "));
+        }
     };
 
     pin_mut!(tcp2udp);
@@ -135,27 +137,79 @@ async fn forward_datagrams_in_buffer(udp_out: &UdpSocket, buffer: &[u8]) -> io::
 /// to `tcp_out` indefinitely, or until an IO error happens on either socket.
 async fn process_udp2tcp(
     udp_in: Arc<UdpSocket>,
-    mut tcp_out: TcpWriteHalf,
-) -> Result<Infallible, Box<dyn std::error::Error>> {
-    // A buffer large enough to hold any possible UDP datagram plus its 16 bit length header.
-    let mut buffer = datagram_buffer();
+    tcp_out: TcpWriteHalf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let qsize = 10;
+    let (empty_tx, empty_rx) = channel(qsize);
+    let (full_tx, full_rx) = channel(qsize);
+    for _ in 0..qsize {
+        empty_tx
+            .send(datagram_buffer())
+            .await
+            .expect("channel is not closed");
+    }
+    let reader = read_from_udp(udp_in, empty_rx, full_tx);
+    let writer = write_to_tcp(tcp_out, full_rx, empty_tx);
+    pin_mut!(reader);
+    pin_mut!(writer);
+
+    // Wait until the reader or writer future terminates.
+    // TODO: is there a risk of swallowing errors here?
+    select(reader, writer).await.factor_first().0?;
+    Ok(())
+}
+
+type Buffer = Box<[u8; MAX_DATAGRAM_SIZE]>;
+
+// Reads datagrams from `udp_in` into empty buffers from `empty_buffers`, add the 16 bits length
+// header, then send the buffers to `full_buffers`.
+async fn read_from_udp(
+    udp_in: Arc<UdpSocket>,
+    mut empty_buffers: Receiver<Buffer>,
+    full_buffers: Sender<Buffer>,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
+        let mut buffer = if let Some(b) = empty_buffers.recv().await {
+            b
+        } else {
+            return Ok(()); // writer has exited
+        };
         let udp_read_len = udp_in
             .recv(&mut buffer[HEADER_LEN..])
             .await
             .context("Failed reading from UDP")?;
-
         // Set the "header" to the length of the datagram.
         let datagram_len =
             u16::try_from(udp_read_len).expect("UDP datagram can't be larger than 2^16");
         buffer[..HEADER_LEN].copy_from_slice(&datagram_len.to_be_bytes()[..]);
+        if full_buffers.send(buffer).await.is_err() {
+            return Ok(()); // writer has exited
+        }
+    }
+}
 
+// Takes buffers from `full_buffers`, write their content to `tcp_out` then send the buffer to
+// `empty_buffers` to be reused.
+async fn write_to_tcp(
+    mut tcp_out: TcpWriteHalf,
+    mut full_buffers: Receiver<Buffer>,
+    empty_buffers: Sender<Buffer>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let buffer = if let Some(b) = full_buffers.recv().await {
+            b
+        } else {
+            return Ok(()); // reader has exited
+        };
+        let len = u16::from_be_bytes(buffer[..HEADER_LEN].try_into().unwrap()) as usize;
         tcp_out
-            .write_all(&buffer[..HEADER_LEN + udp_read_len])
+            .write_all(&buffer[..HEADER_LEN + len])
             .await
             .context("Failed writing to TCP")?;
-
-        log::trace!("Forwarded {} bytes UDP->TCP", udp_read_len);
+        log::trace!("Forwarded {} bytes UDP->TCP", len);
+        if empty_buffers.send(buffer).await.is_err() {
+            return Ok(()); // reader has exited
+        }
     }
 }
 
